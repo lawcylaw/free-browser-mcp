@@ -25,28 +25,21 @@ fs.mkdirSync(USER_DATA_DIR, { recursive: true });
 fs.mkdirSync(TMP_DIR, { recursive: true });
 fs.mkdirSync(BIN_DIR, { recursive: true });
 
-for (const oldDir of [path.join(__dirname, 'headful-env'), path.join(__dirname, 'debian-rootfs')]) {
-  if (fs.existsSync(oldDir)) {
-    try {
-      fs.rmSync(oldDir, { recursive: true, force: true });
-    } catch {}
-  }
-}
-
 process.env.TMPDIR = TMP_DIR;
 process.env.TEMP = TMP_DIR;
 process.env.TMP = TMP_DIR;
 
 function ensureHeadfulEnv() {
-  const marker = path.join(ROOTFS_DIR, 'usr', 'bin', 'Xvfb');
-  if (fs.existsSync(PROOT_BIN) && fs.existsSync(marker)) {
+  const xvfbMarker = path.join(ROOTFS_DIR, 'usr', 'bin', 'Xvfb');
+  const wmMarker = path.join(ROOTFS_DIR, 'usr', 'bin', 'fluxbox');
+  if (fs.existsSync(PROOT_BIN) && fs.existsSync(xvfbMarker) && fs.existsSync(wmMarker)) {
     return true;
   }
   const arch = process.arch === 'arm64' ? 'arm64' : 'amd64';
   const rootfsTar = path.join(TMP_DIR, 'ubuntu-base.tar.gz');
   const rootfsUrl = `https://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release/ubuntu-base-22.04.5-base-${arch}.tar.gz`;
 
-  console.log(`[free-browser-mcp] Installing rootless proot + Ubuntu 22.04.5 Xvfb + noVNC (${arch})...`);
+  console.log(`[free-browser-mcp] Installing rootless proot + Ubuntu 22.04.5 Xvfb + Fluxbox + noVNC (${arch})...`);
   try {
     if (!fs.existsSync(PROOT_BIN) || fs.statSync(PROOT_BIN).size < 100000) {
       execSync(
@@ -59,18 +52,16 @@ function ensureHeadfulEnv() {
         fs.rmSync(ROOTFS_DIR, { recursive: true, force: true });
       }
       fs.mkdirSync(ROOTFS_DIR, { recursive: true });
-      console.log(`[free-browser-mcp] Downloading ${rootfsUrl}...`);
       execSync(`curl -fL --retry 3 "${rootfsUrl}" -o "${rootfsTar}"`, { stdio: 'inherit' });
-      // 用 proot -0 模擬 root 解壓，避免非 root 權限寫入唯讀目錄報錯
       execSync(`"${PROOT_BIN}" -0 tar -xzf "${rootfsTar}" -C "${ROOTFS_DIR}"`, { stdio: 'inherit' });
       fs.rmSync(rootfsTar, { force: true });
       fs.writeFileSync(path.join(ROOTFS_DIR, 'etc', 'resolv.conf'), 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n');
     }
     execSync(
-      `"${PROOT_BIN}" -S "${ROOTFS_DIR}" -0 -k 5.15.0 -w /root /bin/bash -c "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends xvfb x11vnc novnc websockify && rm -rf /var/lib/apt/lists/*"`,
+      `"${PROOT_BIN}" -S "${ROOTFS_DIR}" -0 -k 5.15.0 -w /root /bin/bash -c "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends xvfb x11vnc novnc websockify fluxbox x11-utils && rm -rf /var/lib/apt/lists/*"`,
       { stdio: 'inherit' }
     );
-    console.log('[free-browser-mcp] Headful Xvfb + noVNC environment ready.');
+    console.log('[free-browser-mcp] Headful Xvfb + Fluxbox + noVNC environment ready.');
     return true;
   } catch (err) {
     console.error('[free-browser-mcp] Failed to install headful-env:', err.message);
@@ -82,7 +73,10 @@ function startHeadfulDisplay() {
   const children = [];
   if (!ensureHeadfulEnv()) return children;
 
-  console.log('[free-browser-mcp] Starting Xvfb + x11vnc + noVNC on :99 (1280x800x24)...');
+  // 確保外部與 proot 內部共用同一個 /tmp/.X11-unix 目錄
+  fs.mkdirSync('/tmp/.X11-unix', { recursive: true });
+
+  console.log('[free-browser-mcp] Starting Xvfb + Fluxbox + x11vnc + noVNC on :99 (1280x800x24)...');
   const displayProc = spawn(
     PROOT_BIN,
     [
@@ -95,12 +89,14 @@ function startHeadfulDisplay() {
       '/tmp:/tmp',
       '/bin/bash',
       '-c',
-      `Xvfb :99 -screen 0 1280x800x24 -ac +extension GLX +render -noreset &
+      `rm -f /tmp/.X99-lock /tmp/.X11-unix/X99
+       Xvfb :99 -screen 0 1280x800x24 -ac +extension GLX +render -noreset &
        sleep 1
+       DISPLAY=:99 fluxbox &
        x11vnc -display :99 -forever -shared -rfbport ${VNC_PORT} -nopw -quiet &
        websockify --web=/usr/share/novnc/ 127.0.0.1:${NOVNC_PORT} 127.0.0.1:${VNC_PORT}`
     ],
-    { stdio: 'ignore' }
+    { stdio: 'inherit' }
   );
   children.push(displayProc);
   return children;
@@ -223,7 +219,7 @@ function startProxy() {
 
 async function main() {
   const displayChildren = startHeadfulDisplay();
-  await new Promise((r) => setTimeout(r, 2000));
+  await new Promise((r) => setTimeout(r, 2500));
 
   startProxy();
 
@@ -235,7 +231,32 @@ async function main() {
   console.log('[free-browser-mcp] Extracting @sparticuz/chromium...');
   const execPath = await chromium.executablePath();
   console.log(`[free-browser-mcp] Chromium executable: ${execPath}`);
-  console.log(`[free-browser-mcp] LD_LIBRARY_PATH: ${process.env.LD_LIBRARY_PATH || ''}`);
+
+  // 寫入設定檔強制 Chromium 以有頭視窗模式啟動並最大化
+  const configPath = path.join(TMP_DIR, 'playwright-mcp.config.json');
+  fs.writeFileSync(
+    configPath,
+    JSON.stringify({
+      browser: {
+        launchOptions: {
+          executablePath: execPath,
+          headless: false,
+          args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--start-maximized',
+            '--window-position=0,0',
+            '--window-size=1280,800',
+            '--display=:99'
+          ]
+        },
+        contextOptions: {
+          viewport: { width: 1280, height: 800 }
+        }
+      }
+    }, null, 2)
+  );
 
   const childEnv = {
     ...process.env,
@@ -243,8 +264,7 @@ async function main() {
     PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS: 'true',
   };
 
-  // Headful mode: removed --headless, running against DISPLAY=:99
-  const mcpCmd = `npx --no-install @playwright/mcp --executable-path ${execPath} --no-sandbox --user-data-dir ${USER_DATA_DIR} --viewport-size 1280,800`;
+  const mcpCmd = `npx --no-install @playwright/mcp --config ${configPath} --user-data-dir ${USER_DATA_DIR}`;
 
   console.log(`[free-browser-mcp] Starting HEADFUL supergateway SSE (${SSE_PORT}) and StreamableHTTP (${MCP_HTTP_PORT})...`);
   console.log(`[free-browser-mcp] MCP command: ${mcpCmd}`);
