@@ -1,10 +1,13 @@
 const { spawn, execSync } = require('child_process');
 const fs = require('fs');
+const http = require('http');
 const path = require('path');
 const { Readable } = require('stream');
 const { finished } = require('stream/promises');
 
-const PORT = process.env.SERVER_PORT || process.env.PORT || '25975';
+const PORT = Number(process.env.SERVER_PORT || process.env.PORT || 25975);
+const SSE_PORT = 18000;
+const MCP_HTTP_PORT = 18001;
 const USER_DATA_DIR = path.join(__dirname, 'chrome-profile');
 const PLAYWRIGHT_CACHE = path.join(__dirname, '.cache', 'ms-playwright');
 const TMP_DIR = path.join(__dirname, 'tmp');
@@ -72,8 +75,9 @@ function startCloudflared() {
       printed = true;
       const baseUrl = match[0];
       console.log('\n==================================================');
-      console.log(`[free-browser-mcp] HTTPS MCP SSE URL: ${baseUrl}/sse`);
-      console.log(`[free-browser-mcp] HTTPS Health URL:  ${baseUrl}/health`);
+      console.log(`[free-browser-mcp] HTTPS Streamable MCP: ${baseUrl}/mcp`);
+      console.log(`[free-browser-mcp] HTTPS MCP SSE URL:    ${baseUrl}/sse`);
+      console.log(`[free-browser-mcp] HTTPS Health URL:     ${baseUrl}/health`);
       console.log('==================================================\n');
     }
   };
@@ -86,7 +90,60 @@ function startCloudflared() {
   return cf;
 }
 
+function startProxy() {
+  const server = http.createServer((req, res) => {
+    if (req.url === '/health') {
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      res.end('ok');
+      return;
+    }
+
+    const isMcpHttp = req.url.startsWith('/mcp');
+    const isSse = req.url.startsWith('/sse');
+    const targetPort = isMcpHttp ? MCP_HTTP_PORT : SSE_PORT;
+
+    const proxyReq = http.request(
+      {
+        hostname: '127.0.0.1',
+        port: targetPort,
+        path: req.url,
+        method: req.method,
+        headers: { ...req.headers, host: `127.0.0.1:${targetPort}` },
+      },
+      (proxyRes) => {
+        const headers = { ...proxyRes.headers };
+        if (isSse) {
+          headers['x-accel-buffering'] = 'no';
+          headers['cache-control'] = 'no-cache, no-transform';
+        }
+        res.writeHead(proxyRes.statusCode || 200, headers);
+        if (isSse) {
+          // Pad 2KB SSE comment so Cloudflare edge flushes initial event: endpoint immediately
+          res.write(`: ${' '.repeat(2048)}\n\n`);
+        }
+        proxyRes.pipe(res);
+      }
+    );
+
+    proxyReq.on('error', (err) => {
+      if (!res.headersSent) {
+        res.writeHead(502, { 'Content-Type': 'text/plain' });
+      }
+      res.end(`Upstream error: ${err.message}`);
+    });
+
+    req.pipe(proxyReq);
+  });
+
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`[free-browser-mcp] Proxy listening on 0.0.0.0:${PORT} (/mcp, /sse, /message, /health)`);
+  });
+  return server;
+}
+
 async function main() {
+  startProxy();
+
   let cfChild = null;
   if (await ensureCloudflared()) {
     cfChild = startCloudflared();
@@ -107,10 +164,9 @@ async function main() {
   const headlessFlag = process.env.DISPLAY ? '' : ' --headless';
   const mcpCmd = `npx --no-install @playwright/mcp${headlessFlag} --no-sandbox --user-data-dir ${USER_DATA_DIR} --viewport-size 1280,800`;
 
-  console.log(`[free-browser-mcp] Starting supergateway on port ${PORT}...`);
-  console.log(`[free-browser-mcp] MCP command: ${mcpCmd}`);
+  console.log(`[free-browser-mcp] Starting supergateway SSE (${SSE_PORT}) and StreamableHTTP (${MCP_HTTP_PORT})...`);
 
-  const child = spawn(
+  const sseChild = spawn(
     'npx',
     [
       '--no-install',
@@ -118,30 +174,46 @@ async function main() {
       '--stdio',
       mcpCmd,
       '--port',
-      PORT,
+      String(SSE_PORT),
       '--ssePath',
       '/sse',
       '--messagePath',
       '/message',
-      '--healthEndpoint',
-      '/health',
     ],
-    {
-      stdio: 'inherit',
-      env: childEnv,
-    }
+    { stdio: 'inherit', env: childEnv }
   );
 
-  child.on('exit', (code, signal) => {
-    console.log(`[free-browser-mcp] supergateway exited with code=${code} signal=${signal}`);
-    if (cfChild) cfChild.kill('SIGTERM');
-    process.exit(code ?? 1);
-  });
+  const httpChild = spawn(
+    'npx',
+    [
+      '--no-install',
+      'supergateway',
+      '--stdio',
+      mcpCmd,
+      '--outputTransport',
+      'streamableHttp',
+      '--port',
+      String(MCP_HTTP_PORT),
+      '--streamableHttpPath',
+      '/mcp',
+    ],
+    { stdio: 'inherit', env: childEnv }
+  );
 
   const shutdown = () => {
     if (cfChild) cfChild.kill('SIGTERM');
-    child.kill('SIGTERM');
+    sseChild.kill('SIGTERM');
+    httpChild.kill('SIGTERM');
+    process.exit(0);
   };
+
+  sseChild.on('exit', (code) => {
+    console.log(`[free-browser-mcp] supergateway SSE exited with code=${code}`);
+  });
+  httpChild.on('exit', (code) => {
+    console.log(`[free-browser-mcp] supergateway StreamableHTTP exited with code=${code}`);
+  });
+
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
 }
