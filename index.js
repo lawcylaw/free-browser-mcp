@@ -30,7 +30,7 @@ const childEnv = {
 function hasChromium() {
   if (fs.existsSync(PLAYWRIGHT_CACHE)) {
     const entries = fs.readdirSync(PLAYWRIGHT_CACHE);
-    if (entries.some((e) => e.startsWith('chromium'))) {
+    if (entries.some((e) => e.startsWith('chromium-'))) {
       return true;
     }
   }
@@ -118,7 +118,6 @@ function startProxy() {
         }
         res.writeHead(proxyRes.statusCode || 200, headers);
         if (isSse) {
-          // Pad 2KB SSE comment so Cloudflare edge flushes initial event: endpoint immediately
           res.write(`: ${' '.repeat(2048)}\n\n`);
         }
         proxyRes.pipe(res);
@@ -152,7 +151,7 @@ async function main() {
   if (!hasChromium()) {
     console.log('[free-browser-mcp] Chromium not found, installing via playwright (TMPDIR=/home/container/tmp)...');
     try {
-      execSync('npx --no-install playwright install chromium-headless-shell', {
+      execSync('npx --no-install playwright install chromium', {
         stdio: 'inherit',
         env: childEnv,
       });
@@ -162,9 +161,10 @@ async function main() {
   }
 
   const headlessFlag = process.env.DISPLAY ? '' : ' --headless';
-  const mcpCmd = `npx --no-install @playwright/mcp${headlessFlag} --no-sandbox --user-data-dir ${USER_DATA_DIR} --viewport-size 1280,800`;
+  const mcpCmd = `npx --no-install @playwright/mcp --browser chromium${headlessFlag} --no-sandbox --user-data-dir ${USER_DATA_DIR} --viewport-size 1280,800`;
 
   console.log(`[free-browser-mcp] Starting supergateway SSE (${SSE_PORT}) and StreamableHTTP (${MCP_HTTP_PORT})...`);
+  console.log(`[free-browser-mcp] MCP command: ${mcpCmd}`);
 
   const sseChild = spawn(
     'npx',
