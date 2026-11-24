@@ -232,18 +232,6 @@ async function main() {
   const execPath = await chromium.executablePath();
   console.log(`[free-browser-mcp] Chromium executable: ${execPath}`);
 
-  // 掛載 Ubuntu rootfs 內的 GTK3 / NSS / X11 動態庫路徑，讓有頭視窗正常繪製
-  const ubuntuLibDirs = [
-    path.join(ROOTFS_DIR, 'usr', 'lib', 'x86_64-linux-gnu'),
-    path.join(ROOTFS_DIR, 'lib', 'x86_64-linux-gnu'),
-    path.join(ROOTFS_DIR, 'usr', 'lib', 'aarch64-linux-gnu'),
-    path.join(ROOTFS_DIR, 'lib', 'aarch64-linux-gnu'),
-  ].filter((d) => fs.existsSync(d));
-
-  const mergedLdPath = [process.env.LD_LIBRARY_PATH, ...ubuntuLibDirs]
-    .filter(Boolean)
-    .join(':');
-
   const configPath = path.join(TMP_DIR, 'playwright-mcp.config.json');
   fs.writeFileSync(
     configPath,
@@ -270,10 +258,10 @@ async function main() {
     }, null, 2)
   );
 
+  // 保持宿主機原本的 LD_LIBRARY_PATH，避免覆蓋宿主機的 glibc 2.38+
   const childEnv = {
     ...process.env,
     DISPLAY: ':99',
-    LD_LIBRARY_PATH: mergedLdPath,
     PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS: 'true',
   };
 
