@@ -17,7 +17,6 @@ const NOVNC_PORT = 6080;
 const USER_DATA_DIR = path.join(__dirname, 'chrome-profile');
 const TMP_DIR = path.join(__dirname, 'tmp');
 const BIN_DIR = path.join(__dirname, 'bin');
-const LEGACY_ENV_DIR = path.join(__dirname, 'headful-env');
 const ROOTFS_DIR = path.join(__dirname, 'ubuntu-rootfs');
 const CLOUDFLARED_BIN = path.join(BIN_DIR, 'cloudflared');
 const PROOT_BIN = path.join(BIN_DIR, 'proot');
@@ -26,8 +25,7 @@ fs.mkdirSync(USER_DATA_DIR, { recursive: true });
 fs.mkdirSync(TMP_DIR, { recursive: true });
 fs.mkdirSync(BIN_DIR, { recursive: true });
 
-// 清理舊的失敗殘留目錄
-for (const oldDir of [LEGACY_ENV_DIR, path.join(__dirname, 'debian-rootfs')]) {
+for (const oldDir of [path.join(__dirname, 'headful-env'), path.join(__dirname, 'debian-rootfs')]) {
   if (fs.existsSync(oldDir)) {
     try {
       fs.rmSync(oldDir, { recursive: true, force: true });
@@ -45,20 +43,27 @@ function ensureHeadfulEnv() {
     return true;
   }
   const arch = process.arch === 'arm64' ? 'arm64' : 'amd64';
-  console.log(`[free-browser-mcp] Installing rootless proot + Ubuntu Xvfb + noVNC (${arch})...`);
+  const rootfsTar = path.join(TMP_DIR, 'ubuntu-base.tar.gz');
+  const rootfsUrl = `https://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release/ubuntu-base-22.04.5-base-${arch}.tar.gz`;
+
+  console.log(`[free-browser-mcp] Installing rootless proot + Ubuntu 22.04.5 Xvfb + noVNC (${arch})...`);
   try {
     if (!fs.existsSync(PROOT_BIN) || fs.statSync(PROOT_BIN).size < 100000) {
       execSync(
-        `curl -fLs "https://proot.gitlab.io/proot/bin/proot" -o "${PROOT_BIN}" && chmod +x "${PROOT_BIN}"`,
+        `curl -fL --retry 3 "https://proot.gitlab.io/proot/bin/proot" -o "${PROOT_BIN}" && chmod +x "${PROOT_BIN}"`,
         { stdio: 'inherit' }
       );
     }
     if (!fs.existsSync(path.join(ROOTFS_DIR, 'bin', 'bash'))) {
+      if (fs.existsSync(ROOTFS_DIR)) {
+        fs.rmSync(ROOTFS_DIR, { recursive: true, force: true });
+      }
       fs.mkdirSync(ROOTFS_DIR, { recursive: true });
-      execSync(
-        `curl -fLs "https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.1-base-${arch}.tar.gz" | tar -xz -C "${ROOTFS_DIR}"`,
-        { stdio: 'inherit' }
-      );
+      console.log(`[free-browser-mcp] Downloading ${rootfsUrl}...`);
+      execSync(`curl -fL --retry 3 "${rootfsUrl}" -o "${rootfsTar}"`, { stdio: 'inherit' });
+      // 用 proot -0 模擬 root 解壓，避免非 root 權限寫入唯讀目錄報錯
+      execSync(`"${PROOT_BIN}" -0 tar -xzf "${rootfsTar}" -C "${ROOTFS_DIR}"`, { stdio: 'inherit' });
+      fs.rmSync(rootfsTar, { force: true });
       fs.writeFileSync(path.join(ROOTFS_DIR, 'etc', 'resolv.conf'), 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n');
     }
     execSync(
@@ -197,7 +202,6 @@ function startProxy() {
     req.pipe(proxyReq);
   });
 
-  // WebSocket upgrade forwarding for noVNC (/websockify)
   server.on('upgrade', (req, socket, head) => {
     const upstream = net.connect(NOVNC_PORT, '127.0.0.1', () => {
       const reqHeaders = Object.entries(req.headers)
