@@ -55,7 +55,6 @@ function ensureHeadfulEnv() {
       fs.rmSync(rootfsTar, { force: true });
       fs.writeFileSync(path.join(ROOTFS_DIR, 'etc', 'resolv.conf'), 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n');
     }
-    // 清除舊的 debian.list 並加入專為 Ubuntu 22.04 (jammy) 編譯的 xtradeb PPA 安裝原生非 Snap 版 chromium
     execSync(
       `"${PROOT_BIN}" -S "${ROOTFS_DIR}" -0 -k 5.15.0 -w /root /bin/bash -c "rm -f /etc/apt/sources.list.d/debian.list /etc/apt/preferences.d/chromium && apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates gnupg software-properties-common xvfb x11vnc novnc websockify fluxbox x11-utils x11-xserver-utils fonts-noto-cjk && add-apt-repository -y ppa:xtradeb/apps && apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends chromium && rm -rf /var/lib/apt/lists/*"`,
       { stdio: 'inherit' }
@@ -99,8 +98,11 @@ function startHeadfulDisplay() {
        Xvfb :99 -screen 0 1280x800x24 -ac +extension GLX +render -noreset &
        sleep 1
        mkdir -p /root/.fluxbox
-       echo "session.screen0.rootCommand: xsetroot -solid '#1e1e2e'" > /root/.fluxbox/init
-       DISPLAY=:99 fluxbox &
+       cat << 'EOF' > /root/.fluxbox/init
+session.screen0.rootCommand: xsetroot -solid '#1e1e2e'
+session.screen0.toolbar.visible: true
+EOF
+       HOME=/root DISPLAY=:99 fluxbox -rc /root/.fluxbox/init &
        x11vnc -display :99 -forever -shared -rfbport ${VNC_PORT} -nopw -quiet &
        websockify --web=/usr/share/novnc/ 127.0.0.1:${NOVNC_PORT} 127.0.0.1:${VNC_PORT}`
     ],
@@ -266,7 +268,7 @@ async function main() {
 
   const mcpCmd = `npx --no-install @playwright/mcp --config ${configPath} --user-data-dir ${USER_DATA_DIR}`;
 
-  console.log(`[free-browser-mcp] Starting HEADFUL supergateway SSE (${SSE_PORT}) and StreamableHTTP (${MCP_HTTP_PORT})...`);
+  console.log(`[free-browser-mcp] Starting STATEFUL HEADFUL supergateway SSE (${SSE_PORT}) and StreamableHTTP (${MCP_HTTP_PORT})...`);
   console.log(`[free-browser-mcp] MCP command: ${mcpCmd}`);
 
   const sseChild = spawn(
@@ -295,6 +297,9 @@ async function main() {
       mcpCmd,
       '--outputTransport',
       'streamableHttp',
+      '--stateful',
+      '--sessionTimeout',
+      '600000',
       '--port',
       String(MCP_HTTP_PORT),
       '--streamableHttpPath',
