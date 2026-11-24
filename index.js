@@ -1,6 +1,7 @@
-const { spawn } = require('child_process');
+const { spawn, execSync } = require('child_process');
 const fs = require('fs');
 const http = require('http');
+const net = require('net');
 const path = require('path');
 const { Readable } = require('stream');
 const { finished } = require('stream/promises');
@@ -10,10 +11,19 @@ const chromium = chromiumMod.default || chromiumMod;
 const PORT = Number(process.env.SERVER_PORT || process.env.PORT || 25975);
 const SSE_PORT = 18000;
 const MCP_HTTP_PORT = 18001;
+const VNC_PORT = 5900;
+const NOVNC_PORT = 6080;
+
 const USER_DATA_DIR = path.join(__dirname, 'chrome-profile');
 const TMP_DIR = path.join(__dirname, 'tmp');
 const BIN_DIR = path.join(__dirname, 'bin');
+const ENV_DIR = path.join(__dirname, 'headful-env');
 const CLOUDFLARED_BIN = path.join(BIN_DIR, 'cloudflared');
+const MAMBA_BIN = path.join(BIN_DIR, 'micromamba');
+const XVFB_BIN = path.join(ENV_DIR, 'bin', 'Xvfb');
+const X11VNC_BIN = path.join(ENV_DIR, 'bin', 'x11vnc');
+const WEBSOCKIFY_BIN = path.join(ENV_DIR, 'bin', 'websockify');
+const NOVNC_WEB_DIR = path.join(ENV_DIR, 'share', 'novnc');
 
 fs.mkdirSync(USER_DATA_DIR, { recursive: true });
 fs.mkdirSync(TMP_DIR, { recursive: true });
@@ -22,6 +32,64 @@ fs.mkdirSync(BIN_DIR, { recursive: true });
 process.env.TMPDIR = TMP_DIR;
 process.env.TEMP = TMP_DIR;
 process.env.TMP = TMP_DIR;
+
+function ensureHeadfulEnv() {
+  if (fs.existsSync(XVFB_BIN) && fs.existsSync(X11VNC_BIN) && fs.existsSync(WEBSOCKIFY_BIN)) {
+    return true;
+  }
+  const arch = process.arch === 'arm64' ? 'linux-aarch64' : 'linux-64';
+  console.log(`[free-browser-mcp] Installing rootless Xvfb + x11vnc + noVNC (${arch})...`);
+  try {
+    if (!fs.existsSync(MAMBA_BIN)) {
+      execSync(
+        `curl -Ls https://micro.mamba.pm/api/micromamba/${arch}/latest | tar -xvj -C "${__dirname}" bin/micromamba`,
+        { stdio: 'inherit' }
+      );
+    }
+    execSync(
+      `"${MAMBA_BIN}" create -y -p "${ENV_DIR}" -c conda-forge xorg-x11-server-xvfb-cos7 x11vnc websockify novnc`,
+      { stdio: 'inherit' }
+    );
+    console.log('[free-browser-mcp] Headful Xvfb + noVNC environment ready.');
+    return true;
+  } catch (err) {
+    console.error('[free-browser-mcp] Failed to install headful-env:', err.message);
+    return false;
+  }
+}
+
+function startHeadfulDisplay() {
+  const children = [];
+  if (!ensureHeadfulEnv()) return children;
+
+  console.log('[free-browser-mcp] Starting Xvfb on :99 (1280x800x24)...');
+  const xvfb = spawn(
+    XVFB_BIN,
+    [':99', '-screen', '0', '1280x800x24', '-ac', '+extension', 'GLX', '+render', '-noreset'],
+    { stdio: 'ignore' }
+  );
+  children.push(xvfb);
+
+  if (fs.existsSync(X11VNC_BIN)) {
+    const x11vnc = spawn(
+      X11VNC_BIN,
+      ['-display', ':99', '-forever', '-shared', '-rfbport', String(VNC_PORT), '-nopw', '-quiet'],
+      { stdio: 'ignore' }
+    );
+    children.push(x11vnc);
+  }
+
+  if (fs.existsSync(WEBSOCKIFY_BIN) && fs.existsSync(NOVNC_WEB_DIR)) {
+    const novnc = spawn(
+      WEBSOCKIFY_BIN,
+      [`--web=${NOVNC_WEB_DIR}`, `127.0.0.1:${NOVNC_PORT}`, `127.0.0.1:${VNC_PORT}`],
+      { stdio: 'ignore' }
+    );
+    children.push(novnc);
+  }
+
+  return children;
+}
 
 async function ensureCloudflared() {
   if (fs.existsSync(CLOUDFLARED_BIN)) return true;
@@ -61,6 +129,7 @@ function startCloudflared() {
       console.log('\n==================================================');
       console.log(`[free-browser-mcp] HTTPS Streamable MCP: ${baseUrl}/mcp`);
       console.log(`[free-browser-mcp] HTTPS MCP SSE URL:    ${baseUrl}/sse`);
+      console.log(`[free-browser-mcp] HTTPS noVNC Viewer:   ${baseUrl}/vnc.html?autoconnect=1&resize=scale`);
       console.log(`[free-browser-mcp] HTTPS Health URL:     ${baseUrl}/health`);
       console.log('==================================================\n');
     }
@@ -83,8 +152,8 @@ function startProxy() {
     }
 
     const isMcpHttp = req.url.startsWith('/mcp');
-    const isSse = req.url.startsWith('/sse');
-    const targetPort = isMcpHttp ? MCP_HTTP_PORT : SSE_PORT;
+    const isSse = req.url.startsWith('/sse') || req.url.startsWith('/message');
+    const targetPort = isMcpHttp ? MCP_HTTP_PORT : isSse ? SSE_PORT : NOVNC_PORT;
 
     const proxyReq = http.request(
       {
@@ -118,13 +187,30 @@ function startProxy() {
     req.pipe(proxyReq);
   });
 
+  // WebSocket upgrade forwarding for noVNC (/websockify)
+  server.on('upgrade', (req, socket, head) => {
+    const upstream = net.connect(NOVNC_PORT, '127.0.0.1', () => {
+      const reqHeaders = Object.entries(req.headers)
+        .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(', ') : v}`)
+        .join('\r\n');
+      upstream.write(`${req.method} ${req.url} HTTP/${req.httpVersion}\r\n${reqHeaders}\r\n\r\n`);
+      if (head && head.length) upstream.write(head);
+      socket.pipe(upstream).pipe(socket);
+    });
+    upstream.on('error', () => socket.destroy());
+    socket.on('error', () => upstream.destroy());
+  });
+
   server.listen(PORT, '0.0.0.0', () => {
-    console.log(`[free-browser-mcp] Proxy listening on 0.0.0.0:${PORT} (/mcp, /sse, /message, /health)`);
+    console.log(`[free-browser-mcp] Proxy listening on 0.0.0.0:${PORT} (/mcp, /sse, /message, /vnc.html, /health)`);
   });
   return server;
 }
 
 async function main() {
+  const displayChildren = startHeadfulDisplay();
+  await new Promise((r) => setTimeout(r, 1500));
+
   startProxy();
 
   let cfChild = null;
@@ -139,12 +225,14 @@ async function main() {
 
   const childEnv = {
     ...process.env,
+    DISPLAY: ':99',
     PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS: 'true',
   };
 
-  const mcpCmd = `npx --no-install @playwright/mcp --executable-path ${execPath} --headless --no-sandbox --user-data-dir ${USER_DATA_DIR} --viewport-size 1280,800`;
+  // Headful mode: removed --headless, running against DISPLAY=:99
+  const mcpCmd = `npx --no-install @playwright/mcp --executable-path ${execPath} --no-sandbox --user-data-dir ${USER_DATA_DIR} --viewport-size 1280,800`;
 
-  console.log(`[free-browser-mcp] Starting supergateway SSE (${SSE_PORT}) and StreamableHTTP (${MCP_HTTP_PORT})...`);
+  console.log(`[free-browser-mcp] Starting HEADFUL supergateway SSE (${SSE_PORT}) and StreamableHTTP (${MCP_HTTP_PORT})...`);
   console.log(`[free-browser-mcp] MCP command: ${mcpCmd}`);
 
   const sseChild = spawn(
@@ -185,6 +273,9 @@ async function main() {
     if (cfChild) cfChild.kill('SIGTERM');
     sseChild.kill('SIGTERM');
     httpChild.kill('SIGTERM');
+    for (const c of displayChildren) {
+      try { c.kill('SIGTERM'); } catch {}
+    }
     process.exit(0);
   };
 
