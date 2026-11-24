@@ -1,16 +1,26 @@
 FROM mcr.microsoft.com/playwright:v1.50.0-noble
 
-ENV DEBIAN_FRONTEND=noninteractive
+ENV DEBIAN_FRONTEND=noninteractive \
+    DISPLAY=:99
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     supervisor \
     nginx \
     xvfb \
-    fluxbox \
+    xfce4 \
+    xfce4-terminal \
+    dbus-x11 \
     x11vnc \
     novnc \
     websockify \
+    xdotool \
+    scrot \
+    fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY package.json desktop-mcp.mjs ./
+RUN npm install --omit=dev
 
 RUN npm install -g @playwright/mcp@latest supergateway
 
