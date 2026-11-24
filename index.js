@@ -30,15 +30,14 @@ process.env.TMP = TMP_DIR;
 
 function ensureHeadfulEnv() {
   const marker = path.join(ROOTFS_DIR, 'usr', 'bin', 'chromium');
-  const markerAlt = path.join(ROOTFS_DIR, 'usr', 'bin', 'chromium-browser');
-  if (fs.existsSync(PROOT_BIN) && (fs.existsSync(marker) || fs.existsSync(markerAlt))) {
+  if (fs.existsSync(PROOT_BIN) && fs.existsSync(marker)) {
     return true;
   }
   const arch = process.arch === 'arm64' ? 'arm64' : 'amd64';
   const rootfsTar = path.join(TMP_DIR, 'ubuntu-base.tar.gz');
   const rootfsUrl = `https://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release/ubuntu-base-22.04.5-base-${arch}.tar.gz`;
 
-  console.log(`[free-browser-mcp] Installing rootless proot + Xvfb + Fluxbox + Desktop Chromium (${arch})...`);
+  console.log(`[free-browser-mcp] Installing rootless proot + Xvfb + Fluxbox + Ubuntu 22.04 Chromium (${arch})...`);
   try {
     if (!fs.existsSync(PROOT_BIN) || fs.statSync(PROOT_BIN).size < 100000) {
       execSync(
@@ -56,8 +55,9 @@ function ensureHeadfulEnv() {
       fs.rmSync(rootfsTar, { force: true });
       fs.writeFileSync(path.join(ROOTFS_DIR, 'etc', 'resolv.conf'), 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n');
     }
+    // 清除舊的 debian.list 並加入專為 Ubuntu 22.04 (jammy) 編譯的 xtradeb PPA 安裝原生非 Snap 版 chromium
     execSync(
-      `"${PROOT_BIN}" -S "${ROOTFS_DIR}" -0 -k 5.15.0 -w /root /bin/bash -c "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates gnupg xvfb x11vnc novnc websockify fluxbox x11-utils x11-xserver-utils fonts-noto-cjk && echo 'deb [trusted=yes] http://deb.debian.org/debian bookworm main' > /etc/apt/sources.list.d/debian.list && printf 'Package: *\\nPin: release n=bookworm\\nPin-Priority: 100\\n\\nPackage: chromium*\\nPin: release n=bookworm\\nPin-Priority: 900\\n' > /etc/apt/preferences.d/chromium && apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends chromium && rm -rf /var/lib/apt/lists/*"`,
+      `"${PROOT_BIN}" -S "${ROOTFS_DIR}" -0 -k 5.15.0 -w /root /bin/bash -c "rm -f /etc/apt/sources.list.d/debian.list /etc/apt/preferences.d/chromium && apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates gnupg software-properties-common xvfb x11vnc novnc websockify fluxbox x11-utils x11-xserver-utils fonts-noto-cjk && add-apt-repository -y ppa:xtradeb/apps && apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends chromium && rm -rf /var/lib/apt/lists/*"`,
       { stdio: 'inherit' }
     );
     console.log('[free-browser-mcp] Desktop Chromium + Xvfb + noVNC ready.');
