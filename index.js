@@ -18,7 +18,7 @@ const USER_DATA_DIR = path.join(__dirname, 'chrome-profile');
 const TMP_DIR = path.join(__dirname, 'tmp');
 const BIN_DIR = path.join(__dirname, 'bin');
 const LEGACY_ENV_DIR = path.join(__dirname, 'headful-env');
-const ROOTFS_DIR = path.join(__dirname, 'debian-rootfs');
+const ROOTFS_DIR = path.join(__dirname, 'ubuntu-rootfs');
 const CLOUDFLARED_BIN = path.join(BIN_DIR, 'cloudflared');
 const PROOT_BIN = path.join(BIN_DIR, 'proot');
 
@@ -26,11 +26,13 @@ fs.mkdirSync(USER_DATA_DIR, { recursive: true });
 fs.mkdirSync(TMP_DIR, { recursive: true });
 fs.mkdirSync(BIN_DIR, { recursive: true });
 
-// 自動清理舊的失敗殘留目錄
-if (fs.existsSync(LEGACY_ENV_DIR)) {
-  try {
-    fs.rmSync(LEGACY_ENV_DIR, { recursive: true, force: true });
-  } catch {}
+// 清理舊的失敗殘留目錄
+for (const oldDir of [LEGACY_ENV_DIR, path.join(__dirname, 'debian-rootfs')]) {
+  if (fs.existsSync(oldDir)) {
+    try {
+      fs.rmSync(oldDir, { recursive: true, force: true });
+    } catch {}
+  }
 }
 
 process.env.TMPDIR = TMP_DIR;
@@ -42,26 +44,25 @@ function ensureHeadfulEnv() {
   if (fs.existsSync(PROOT_BIN) && fs.existsSync(marker)) {
     return true;
   }
-  const arch = process.arch === 'arm64' ? 'aarch64' : 'x86_64';
-  const debArch = process.arch === 'arm64' ? 'arm64' : 'amd64';
-  console.log(`[free-browser-mcp] Installing rootless proot + Debian Xvfb + noVNC (${arch})...`);
+  const arch = process.arch === 'arm64' ? 'arm64' : 'amd64';
+  console.log(`[free-browser-mcp] Installing rootless proot + Ubuntu Xvfb + noVNC (${arch})...`);
   try {
-    if (!fs.existsSync(PROOT_BIN)) {
+    if (!fs.existsSync(PROOT_BIN) || fs.statSync(PROOT_BIN).size < 100000) {
       execSync(
-        `curl -Ls "https://proot.gitlab.io/proot/bin/proot" -o "${PROOT_BIN}" && chmod +x "${PROOT_BIN}"`,
+        `curl -fLs "https://proot.gitlab.io/proot/bin/proot" -o "${PROOT_BIN}" && chmod +x "${PROOT_BIN}"`,
         { stdio: 'inherit' }
       );
     }
     if (!fs.existsSync(path.join(ROOTFS_DIR, 'bin', 'bash'))) {
       fs.mkdirSync(ROOTFS_DIR, { recursive: true });
       execSync(
-        `curl -Ls "https://github.com/debuerreotype/docker-debian-artifacts/raw/dist-${debArch}/bookworm/slim/rootfs.tar.xz" | tar -xJ -C "${ROOTFS_DIR}"`,
+        `curl -fLs "https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.1-base-${arch}.tar.gz" | tar -xz -C "${ROOTFS_DIR}"`,
         { stdio: 'inherit' }
       );
-      fs.writeFileSync(path.join(ROOTFS_DIR, 'etc', 'resolv.conf'), 'nameserver 1.1.1.1\n');
+      fs.writeFileSync(path.join(ROOTFS_DIR, 'etc', 'resolv.conf'), 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n');
     }
     execSync(
-      `"${PROOT_BIN}" -S "${ROOTFS_DIR}" -0 -w /root /bin/bash -c "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends xvfb x11vnc novnc websockify && rm -rf /var/lib/apt/lists/*"`,
+      `"${PROOT_BIN}" -S "${ROOTFS_DIR}" -0 -k 5.15.0 -w /root /bin/bash -c "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends xvfb x11vnc novnc websockify && rm -rf /var/lib/apt/lists/*"`,
       { stdio: 'inherit' }
     );
     console.log('[free-browser-mcp] Headful Xvfb + noVNC environment ready.');
@@ -83,6 +84,8 @@ function startHeadfulDisplay() {
       '-S',
       ROOTFS_DIR,
       '-0',
+      '-k',
+      '5.15.0',
       '-b',
       '/tmp:/tmp',
       '/bin/bash',
