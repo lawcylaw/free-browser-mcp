@@ -17,37 +17,51 @@ const NOVNC_PORT = 6080;
 const USER_DATA_DIR = path.join(__dirname, 'chrome-profile');
 const TMP_DIR = path.join(__dirname, 'tmp');
 const BIN_DIR = path.join(__dirname, 'bin');
-const ENV_DIR = path.join(__dirname, 'headful-env');
+const LEGACY_ENV_DIR = path.join(__dirname, 'headful-env');
+const ROOTFS_DIR = path.join(__dirname, 'debian-rootfs');
 const CLOUDFLARED_BIN = path.join(BIN_DIR, 'cloudflared');
-const MAMBA_BIN = path.join(BIN_DIR, 'micromamba');
-const XVFB_BIN = path.join(ENV_DIR, 'bin', 'Xvfb');
-const X11VNC_BIN = path.join(ENV_DIR, 'bin', 'x11vnc');
-const WEBSOCKIFY_BIN = path.join(ENV_DIR, 'bin', 'websockify');
-const NOVNC_WEB_DIR = path.join(ENV_DIR, 'share', 'novnc');
+const PROOT_BIN = path.join(BIN_DIR, 'proot');
 
 fs.mkdirSync(USER_DATA_DIR, { recursive: true });
 fs.mkdirSync(TMP_DIR, { recursive: true });
 fs.mkdirSync(BIN_DIR, { recursive: true });
+
+// 自動清理舊的失敗殘留目錄
+if (fs.existsSync(LEGACY_ENV_DIR)) {
+  try {
+    fs.rmSync(LEGACY_ENV_DIR, { recursive: true, force: true });
+  } catch {}
+}
 
 process.env.TMPDIR = TMP_DIR;
 process.env.TEMP = TMP_DIR;
 process.env.TMP = TMP_DIR;
 
 function ensureHeadfulEnv() {
-  if (fs.existsSync(XVFB_BIN) && fs.existsSync(X11VNC_BIN) && fs.existsSync(WEBSOCKIFY_BIN)) {
+  const marker = path.join(ROOTFS_DIR, 'usr', 'bin', 'Xvfb');
+  if (fs.existsSync(PROOT_BIN) && fs.existsSync(marker)) {
     return true;
   }
-  const arch = process.arch === 'arm64' ? 'linux-aarch64' : 'linux-64';
-  console.log(`[free-browser-mcp] Installing rootless Xvfb + x11vnc + noVNC (${arch})...`);
+  const arch = process.arch === 'arm64' ? 'aarch64' : 'x86_64';
+  const debArch = process.arch === 'arm64' ? 'arm64' : 'amd64';
+  console.log(`[free-browser-mcp] Installing rootless proot + Debian Xvfb + noVNC (${arch})...`);
   try {
-    if (!fs.existsSync(MAMBA_BIN)) {
+    if (!fs.existsSync(PROOT_BIN)) {
       execSync(
-        `curl -Ls https://micro.mamba.pm/api/micromamba/${arch}/latest | tar -xvj -C "${__dirname}" bin/micromamba`,
+        `curl -Ls "https://proot.gitlab.io/proot/bin/proot" -o "${PROOT_BIN}" && chmod +x "${PROOT_BIN}"`,
         { stdio: 'inherit' }
       );
     }
+    if (!fs.existsSync(path.join(ROOTFS_DIR, 'bin', 'bash'))) {
+      fs.mkdirSync(ROOTFS_DIR, { recursive: true });
+      execSync(
+        `curl -Ls "https://github.com/debuerreotype/docker-debian-artifacts/raw/dist-${debArch}/bookworm/slim/rootfs.tar.xz" | tar -xJ -C "${ROOTFS_DIR}"`,
+        { stdio: 'inherit' }
+      );
+      fs.writeFileSync(path.join(ROOTFS_DIR, 'etc', 'resolv.conf'), 'nameserver 1.1.1.1\n');
+    }
     execSync(
-      `"${MAMBA_BIN}" create -y -p "${ENV_DIR}" -c conda-forge xorg-x11-server-xvfb-cos7 x11vnc websockify novnc`,
+      `"${PROOT_BIN}" -S "${ROOTFS_DIR}" -0 -w /root /bin/bash -c "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends xvfb x11vnc novnc websockify && rm -rf /var/lib/apt/lists/*"`,
       { stdio: 'inherit' }
     );
     console.log('[free-browser-mcp] Headful Xvfb + noVNC environment ready.');
@@ -62,32 +76,25 @@ function startHeadfulDisplay() {
   const children = [];
   if (!ensureHeadfulEnv()) return children;
 
-  console.log('[free-browser-mcp] Starting Xvfb on :99 (1280x800x24)...');
-  const xvfb = spawn(
-    XVFB_BIN,
-    [':99', '-screen', '0', '1280x800x24', '-ac', '+extension', 'GLX', '+render', '-noreset'],
+  console.log('[free-browser-mcp] Starting Xvfb + x11vnc + noVNC on :99 (1280x800x24)...');
+  const displayProc = spawn(
+    PROOT_BIN,
+    [
+      '-S',
+      ROOTFS_DIR,
+      '-0',
+      '-b',
+      '/tmp:/tmp',
+      '/bin/bash',
+      '-c',
+      `Xvfb :99 -screen 0 1280x800x24 -ac +extension GLX +render -noreset &
+       sleep 1
+       x11vnc -display :99 -forever -shared -rfbport ${VNC_PORT} -nopw -quiet &
+       websockify --web=/usr/share/novnc/ 127.0.0.1:${NOVNC_PORT} 127.0.0.1:${VNC_PORT}`
+    ],
     { stdio: 'ignore' }
   );
-  children.push(xvfb);
-
-  if (fs.existsSync(X11VNC_BIN)) {
-    const x11vnc = spawn(
-      X11VNC_BIN,
-      ['-display', ':99', '-forever', '-shared', '-rfbport', String(VNC_PORT), '-nopw', '-quiet'],
-      { stdio: 'ignore' }
-    );
-    children.push(x11vnc);
-  }
-
-  if (fs.existsSync(WEBSOCKIFY_BIN) && fs.existsSync(NOVNC_WEB_DIR)) {
-    const novnc = spawn(
-      WEBSOCKIFY_BIN,
-      [`--web=${NOVNC_WEB_DIR}`, `127.0.0.1:${NOVNC_PORT}`, `127.0.0.1:${VNC_PORT}`],
-      { stdio: 'ignore' }
-    );
-    children.push(novnc);
-  }
-
+  children.push(displayProc);
   return children;
 }
 
@@ -209,7 +216,7 @@ function startProxy() {
 
 async function main() {
   const displayChildren = startHeadfulDisplay();
-  await new Promise((r) => setTimeout(r, 1500));
+  await new Promise((r) => setTimeout(r, 2000));
 
   startProxy();
 
