@@ -133,16 +133,25 @@ async function ensureCloudflared() {
 }
 
 function startCloudflared() {
-  const cf = spawn(
-    CLOUDFLARED_BIN,
-    ['tunnel', '--url', `http://127.0.0.1:${PORT}`, '--no-autoupdate'],
-    { stdio: ['ignore', 'pipe', 'pipe'] }
-  );
+  const token = (process.env.CLOUDFLARE_TUNNEL_TOKEN || '').trim();
+  const args = token
+    ? ['tunnel', '--no-autoupdate', 'run', '--token', token]
+    : ['tunnel', '--url', `http://127.0.0.1:${PORT}`, '--no-autoupdate'];
+
+  const cf = spawn(CLOUDFLARED_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
   let printed = false;
   const handleOutput = (chunk) => {
     const text = chunk.toString();
     process.stdout.write(text);
+    if (token && !printed && text.includes('Registered tunnel connection')) {
+      printed = true;
+      console.log('\n==================================================');
+      console.log('[free-browser-mcp] Named Tunnel Connected!');
+      console.log('[free-browser-mcp] Use your fixed Cloudflare Public Hostname (/mcp, /sse, /vnc.html)');
+      console.log('==================================================\n');
+      return;
+    }
     const match = text.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/i);
     if (match && !printed) {
       printed = true;
