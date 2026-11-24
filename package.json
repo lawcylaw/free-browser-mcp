@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "@playwright/mcp": "latest",
+    "@sparticuz/chromium": "latest",
     "supergateway": "latest"
   }
 }
