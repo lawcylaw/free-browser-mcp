@@ -5,8 +5,6 @@ const net = require('net');
 const path = require('path');
 const { Readable } = require('stream');
 const { finished } = require('stream/promises');
-const chromiumMod = require('@sparticuz/chromium');
-const chromium = chromiumMod.default || chromiumMod;
 
 const PORT = Number(process.env.SERVER_PORT || process.env.PORT || 25975);
 const SSE_PORT = 18000;
@@ -20,6 +18,7 @@ const BIN_DIR = path.join(__dirname, 'bin');
 const ROOTFS_DIR = path.join(__dirname, 'ubuntu-rootfs');
 const CLOUDFLARED_BIN = path.join(BIN_DIR, 'cloudflared');
 const PROOT_BIN = path.join(BIN_DIR, 'proot');
+const CHROME_WRAPPER = path.join(BIN_DIR, 'headful-chromium.sh');
 
 fs.mkdirSync(USER_DATA_DIR, { recursive: true });
 fs.mkdirSync(TMP_DIR, { recursive: true });
@@ -30,15 +29,16 @@ process.env.TEMP = TMP_DIR;
 process.env.TMP = TMP_DIR;
 
 function ensureHeadfulEnv() {
-  const marker = path.join(ROOTFS_DIR, 'usr', 'bin', 'xsetroot');
-  if (fs.existsSync(PROOT_BIN) && fs.existsSync(marker)) {
+  const marker = path.join(ROOTFS_DIR, 'usr', 'bin', 'chromium');
+  const markerAlt = path.join(ROOTFS_DIR, 'usr', 'bin', 'chromium-browser');
+  if (fs.existsSync(PROOT_BIN) && (fs.existsSync(marker) || fs.existsSync(markerAlt))) {
     return true;
   }
   const arch = process.arch === 'arm64' ? 'arm64' : 'amd64';
   const rootfsTar = path.join(TMP_DIR, 'ubuntu-base.tar.gz');
   const rootfsUrl = `https://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release/ubuntu-base-22.04.5-base-${arch}.tar.gz`;
 
-  console.log(`[free-browser-mcp] Installing rootless proot + Ubuntu Xvfb + Fluxbox + GUI libs (${arch})...`);
+  console.log(`[free-browser-mcp] Installing rootless proot + Xvfb + Fluxbox + Desktop Chromium (${arch})...`);
   try {
     if (!fs.existsSync(PROOT_BIN) || fs.statSync(PROOT_BIN).size < 100000) {
       execSync(
@@ -57,15 +57,23 @@ function ensureHeadfulEnv() {
       fs.writeFileSync(path.join(ROOTFS_DIR, 'etc', 'resolv.conf'), 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n');
     }
     execSync(
-      `"${PROOT_BIN}" -S "${ROOTFS_DIR}" -0 -k 5.15.0 -w /root /bin/bash -c "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends xvfb x11vnc novnc websockify fluxbox x11-utils x11-xserver-utils libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libdbus-1-3 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2 libpango-1.0-0 libcairo2 libgtk-3-0 fonts-noto-cjk && rm -rf /var/lib/apt/lists/*"`,
+      `"${PROOT_BIN}" -S "${ROOTFS_DIR}" -0 -k 5.15.0 -w /root /bin/bash -c "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates gnupg xvfb x11vnc novnc websockify fluxbox x11-utils x11-xserver-utils fonts-noto-cjk && echo 'deb [trusted=yes] http://deb.debian.org/debian bookworm main' > /etc/apt/sources.list.d/debian.list && printf 'Package: *\\nPin: release n=bookworm\\nPin-Priority: 100\\n\\nPackage: chromium*\\nPin: release n=bookworm\\nPin-Priority: 900\\n' > /etc/apt/preferences.d/chromium && apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends chromium && rm -rf /var/lib/apt/lists/*"`,
       { stdio: 'inherit' }
     );
-    console.log('[free-browser-mcp] Headful Xvfb + Fluxbox + GUI libraries ready.');
+    console.log('[free-browser-mcp] Desktop Chromium + Xvfb + noVNC ready.');
     return true;
   } catch (err) {
     console.error('[free-browser-mcp] Failed to install headful-env:', err.message);
     return false;
   }
+}
+
+function buildChromiumWrapper() {
+  const script = `#!/bin/bash
+unset LD_LIBRARY_PATH
+exec "${PROOT_BIN}" -S "${ROOTFS_DIR}" -0 -k 5.15.0 -b /tmp:/tmp -b /home/container:/home/container /usr/bin/chromium --no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage --disable-gpu --display=:99 "$@"
+`;
+  fs.writeFileSync(CHROME_WRAPPER, script, { mode: 0o755 });
 }
 
 function startHeadfulDisplay() {
@@ -219,6 +227,7 @@ function startProxy() {
 
 async function main() {
   const displayChildren = startHeadfulDisplay();
+  buildChromiumWrapper();
   await new Promise((r) => setTimeout(r, 2500));
 
   startProxy();
@@ -228,27 +237,18 @@ async function main() {
     cfChild = startCloudflared();
   }
 
-  console.log('[free-browser-mcp] Extracting @sparticuz/chromium...');
-  const execPath = await chromium.executablePath();
-  console.log(`[free-browser-mcp] Chromium executable: ${execPath}`);
-
   const configPath = path.join(TMP_DIR, 'playwright-mcp.config.json');
   fs.writeFileSync(
     configPath,
     JSON.stringify({
       browser: {
         launchOptions: {
-          executablePath: execPath,
+          executablePath: CHROME_WRAPPER,
           headless: false,
           args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-gpu',
             '--start-maximized',
             '--window-position=0,0',
-            '--window-size=1280,800',
-            '--display=:99'
+            '--window-size=1280,800'
           ]
         },
         contextOptions: {
@@ -258,7 +258,6 @@ async function main() {
     }, null, 2)
   );
 
-  // 保持宿主機原本的 LD_LIBRARY_PATH，避免覆蓋宿主機的 glibc 2.38+
   const childEnv = {
     ...process.env,
     DISPLAY: ':99',
