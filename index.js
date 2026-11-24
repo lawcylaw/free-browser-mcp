@@ -6,12 +6,23 @@ const { finished } = require('stream/promises');
 
 const PORT = process.env.SERVER_PORT || process.env.PORT || '25975';
 const USER_DATA_DIR = path.join(__dirname, 'chrome-profile');
-const PLAYWRIGHT_CACHE = path.join(process.env.HOME || __dirname, '.cache', 'ms-playwright');
+const PLAYWRIGHT_CACHE = path.join(__dirname, '.cache', 'ms-playwright');
+const TMP_DIR = path.join(__dirname, 'tmp');
 const BIN_DIR = path.join(__dirname, 'bin');
 const CLOUDFLARED_BIN = path.join(BIN_DIR, 'cloudflared');
 
 fs.mkdirSync(USER_DATA_DIR, { recursive: true });
+fs.mkdirSync(PLAYWRIGHT_CACHE, { recursive: true });
+fs.mkdirSync(TMP_DIR, { recursive: true });
 fs.mkdirSync(BIN_DIR, { recursive: true });
+
+const childEnv = {
+  ...process.env,
+  PLAYWRIGHT_BROWSERS_PATH: PLAYWRIGHT_CACHE,
+  TMPDIR: TMP_DIR,
+  TEMP: TMP_DIR,
+  TMP: TMP_DIR,
+};
 
 function hasChromium() {
   if (fs.existsSync(PLAYWRIGHT_CACHE)) {
@@ -76,12 +87,17 @@ function startCloudflared() {
 }
 
 async function main() {
+  let cfChild = null;
+  if (await ensureCloudflared()) {
+    cfChild = startCloudflared();
+  }
+
   if (!hasChromium()) {
-    console.log('[free-browser-mcp] Chromium not found, installing via playwright...');
+    console.log('[free-browser-mcp] Chromium not found, installing via playwright (TMPDIR=/home/container/tmp)...');
     try {
-      execSync('npx --no-install playwright install chromium', {
+      execSync('npx --no-install playwright install chromium-headless-shell', {
         stdio: 'inherit',
-        env: { ...process.env, PLAYWRIGHT_BROWSERS_PATH: PLAYWRIGHT_CACHE },
+        env: childEnv,
       });
     } catch (err) {
       console.error('[free-browser-mcp] Failed to install Chromium:', err.message);
@@ -112,14 +128,9 @@ async function main() {
     ],
     {
       stdio: 'inherit',
-      env: { ...process.env, PLAYWRIGHT_BROWSERS_PATH: PLAYWRIGHT_CACHE },
+      env: childEnv,
     }
   );
-
-  let cfChild = null;
-  if (await ensureCloudflared()) {
-    cfChild = startCloudflared();
-  }
 
   child.on('exit', (code, signal) => {
     console.log(`[free-browser-mcp] supergateway exited with code=${code} signal=${signal}`);
