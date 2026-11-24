@@ -4,7 +4,8 @@ const http = require('http');
 const path = require('path');
 const { Readable } = require('stream');
 const { finished } = require('stream/promises');
-const chromium = require('@sparticuz/chromium');
+const chromiumMod = require('@sparticuz/chromium');
+const chromium = chromiumMod.default || chromiumMod;
 
 const PORT = Number(process.env.SERVER_PORT || process.env.PORT || 25975);
 const SSE_PORT = 18000;
