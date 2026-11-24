@@ -30,16 +30,15 @@ process.env.TEMP = TMP_DIR;
 process.env.TMP = TMP_DIR;
 
 function ensureHeadfulEnv() {
-  const xvfbMarker = path.join(ROOTFS_DIR, 'usr', 'bin', 'Xvfb');
-  const wmMarker = path.join(ROOTFS_DIR, 'usr', 'bin', 'fluxbox');
-  if (fs.existsSync(PROOT_BIN) && fs.existsSync(xvfbMarker) && fs.existsSync(wmMarker)) {
+  const marker = path.join(ROOTFS_DIR, 'usr', 'bin', 'xsetroot');
+  if (fs.existsSync(PROOT_BIN) && fs.existsSync(marker)) {
     return true;
   }
   const arch = process.arch === 'arm64' ? 'arm64' : 'amd64';
   const rootfsTar = path.join(TMP_DIR, 'ubuntu-base.tar.gz');
   const rootfsUrl = `https://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release/ubuntu-base-22.04.5-base-${arch}.tar.gz`;
 
-  console.log(`[free-browser-mcp] Installing rootless proot + Ubuntu 22.04.5 Xvfb + Fluxbox + noVNC (${arch})...`);
+  console.log(`[free-browser-mcp] Installing rootless proot + Ubuntu Xvfb + Fluxbox + GUI libs (${arch})...`);
   try {
     if (!fs.existsSync(PROOT_BIN) || fs.statSync(PROOT_BIN).size < 100000) {
       execSync(
@@ -58,10 +57,10 @@ function ensureHeadfulEnv() {
       fs.writeFileSync(path.join(ROOTFS_DIR, 'etc', 'resolv.conf'), 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n');
     }
     execSync(
-      `"${PROOT_BIN}" -S "${ROOTFS_DIR}" -0 -k 5.15.0 -w /root /bin/bash -c "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends xvfb x11vnc novnc websockify fluxbox x11-utils && rm -rf /var/lib/apt/lists/*"`,
+      `"${PROOT_BIN}" -S "${ROOTFS_DIR}" -0 -k 5.15.0 -w /root /bin/bash -c "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends xvfb x11vnc novnc websockify fluxbox x11-utils x11-xserver-utils libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libdbus-1-3 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2 libpango-1.0-0 libcairo2 libgtk-3-0 fonts-noto-cjk && rm -rf /var/lib/apt/lists/*"`,
       { stdio: 'inherit' }
     );
-    console.log('[free-browser-mcp] Headful Xvfb + Fluxbox + noVNC environment ready.');
+    console.log('[free-browser-mcp] Headful Xvfb + Fluxbox + GUI libraries ready.');
     return true;
   } catch (err) {
     console.error('[free-browser-mcp] Failed to install headful-env:', err.message);
@@ -73,7 +72,6 @@ function startHeadfulDisplay() {
   const children = [];
   if (!ensureHeadfulEnv()) return children;
 
-  // 確保外部與 proot 內部共用同一個 /tmp/.X11-unix 目錄
   fs.mkdirSync('/tmp/.X11-unix', { recursive: true });
 
   console.log('[free-browser-mcp] Starting Xvfb + Fluxbox + x11vnc + noVNC on :99 (1280x800x24)...');
@@ -92,6 +90,8 @@ function startHeadfulDisplay() {
       `rm -f /tmp/.X99-lock /tmp/.X11-unix/X99
        Xvfb :99 -screen 0 1280x800x24 -ac +extension GLX +render -noreset &
        sleep 1
+       mkdir -p /root/.fluxbox
+       echo "session.screen0.rootCommand: xsetroot -solid '#1e1e2e'" > /root/.fluxbox/init
        DISPLAY=:99 fluxbox &
        x11vnc -display :99 -forever -shared -rfbport ${VNC_PORT} -nopw -quiet &
        websockify --web=/usr/share/novnc/ 127.0.0.1:${NOVNC_PORT} 127.0.0.1:${VNC_PORT}`
@@ -232,7 +232,18 @@ async function main() {
   const execPath = await chromium.executablePath();
   console.log(`[free-browser-mcp] Chromium executable: ${execPath}`);
 
-  // 寫入設定檔強制 Chromium 以有頭視窗模式啟動並最大化
+  // 掛載 Ubuntu rootfs 內的 GTK3 / NSS / X11 動態庫路徑，讓有頭視窗正常繪製
+  const ubuntuLibDirs = [
+    path.join(ROOTFS_DIR, 'usr', 'lib', 'x86_64-linux-gnu'),
+    path.join(ROOTFS_DIR, 'lib', 'x86_64-linux-gnu'),
+    path.join(ROOTFS_DIR, 'usr', 'lib', 'aarch64-linux-gnu'),
+    path.join(ROOTFS_DIR, 'lib', 'aarch64-linux-gnu'),
+  ].filter((d) => fs.existsSync(d));
+
+  const mergedLdPath = [process.env.LD_LIBRARY_PATH, ...ubuntuLibDirs]
+    .filter(Boolean)
+    .join(':');
+
   const configPath = path.join(TMP_DIR, 'playwright-mcp.config.json');
   fs.writeFileSync(
     configPath,
@@ -245,6 +256,7 @@ async function main() {
             '--no-sandbox',
             '--disable-setuid-sandbox',
             '--disable-dev-shm-usage',
+            '--disable-gpu',
             '--start-maximized',
             '--window-position=0,0',
             '--window-size=1280,800',
@@ -261,6 +273,7 @@ async function main() {
   const childEnv = {
     ...process.env,
     DISPLAY: ':99',
+    LD_LIBRARY_PATH: mergedLdPath,
     PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS: 'true',
   };
 
