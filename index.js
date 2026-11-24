@@ -1,43 +1,26 @@
-const { spawn, execSync } = require('child_process');
+const { spawn } = require('child_process');
 const fs = require('fs');
 const http = require('http');
 const path = require('path');
 const { Readable } = require('stream');
 const { finished } = require('stream/promises');
+const chromium = require('@sparticuz/chromium');
 
 const PORT = Number(process.env.SERVER_PORT || process.env.PORT || 25975);
 const SSE_PORT = 18000;
 const MCP_HTTP_PORT = 18001;
 const USER_DATA_DIR = path.join(__dirname, 'chrome-profile');
-const PLAYWRIGHT_CACHE = path.join(__dirname, '.cache', 'ms-playwright');
 const TMP_DIR = path.join(__dirname, 'tmp');
 const BIN_DIR = path.join(__dirname, 'bin');
 const CLOUDFLARED_BIN = path.join(BIN_DIR, 'cloudflared');
 
 fs.mkdirSync(USER_DATA_DIR, { recursive: true });
-fs.mkdirSync(PLAYWRIGHT_CACHE, { recursive: true });
 fs.mkdirSync(TMP_DIR, { recursive: true });
 fs.mkdirSync(BIN_DIR, { recursive: true });
 
-const childEnv = {
-  ...process.env,
-  PLAYWRIGHT_BROWSERS_PATH: PLAYWRIGHT_CACHE,
-  TMPDIR: TMP_DIR,
-  TEMP: TMP_DIR,
-  TMP: TMP_DIR,
-};
-
-function hasChromium() {
-  if (fs.existsSync(PLAYWRIGHT_CACHE)) {
-    const entries = fs.readdirSync(PLAYWRIGHT_CACHE);
-    if (entries.some((e) => e.startsWith('chromium-'))) {
-      return true;
-    }
-  }
-  return ['/usr/bin/chromium', '/usr/bin/chromium-browser', '/usr/bin/google-chrome'].some((p) =>
-    fs.existsSync(p)
-  );
-}
+process.env.TMPDIR = TMP_DIR;
+process.env.TEMP = TMP_DIR;
+process.env.TMP = TMP_DIR;
 
 async function ensureCloudflared() {
   if (fs.existsSync(CLOUDFLARED_BIN)) return true;
@@ -148,20 +131,17 @@ async function main() {
     cfChild = startCloudflared();
   }
 
-  if (!hasChromium()) {
-    console.log('[free-browser-mcp] Chromium not found, installing via playwright (TMPDIR=/home/container/tmp)...');
-    try {
-      execSync('npx --no-install playwright install chromium', {
-        stdio: 'inherit',
-        env: childEnv,
-      });
-    } catch (err) {
-      console.error('[free-browser-mcp] Failed to install Chromium:', err.message);
-    }
-  }
+  console.log('[free-browser-mcp] Extracting @sparticuz/chromium...');
+  const execPath = await chromium.executablePath();
+  console.log(`[free-browser-mcp] Chromium executable: ${execPath}`);
+  console.log(`[free-browser-mcp] LD_LIBRARY_PATH: ${process.env.LD_LIBRARY_PATH || ''}`);
 
-  const headlessFlag = process.env.DISPLAY ? '' : ' --headless';
-  const mcpCmd = `npx --no-install @playwright/mcp --browser chromium${headlessFlag} --no-sandbox --user-data-dir ${USER_DATA_DIR} --viewport-size 1280,800`;
+  const childEnv = {
+    ...process.env,
+    PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS: 'true',
+  };
+
+  const mcpCmd = `npx --no-install @playwright/mcp --executable-path ${execPath} --headless --no-sandbox --user-data-dir ${USER_DATA_DIR} --viewport-size 1280,800`;
 
   console.log(`[free-browser-mcp] Starting supergateway SSE (${SSE_PORT}) and StreamableHTTP (${MCP_HTTP_PORT})...`);
   console.log(`[free-browser-mcp] MCP command: ${mcpCmd}`);
