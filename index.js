@@ -17,6 +17,7 @@ const TMP_DIR = path.join(__dirname, 'tmp');
 const BIN_DIR = path.join(__dirname, 'bin');
 const ROOTFS_DIR = path.join(__dirname, 'ubuntu-rootfs');
 const CLOUDFLARED_BIN = path.join(BIN_DIR, 'cloudflared');
+const NGROK_BIN = path.join(BIN_DIR, 'ngrok');
 const PROOT_BIN = path.join(BIN_DIR, 'proot');
 const CHROME_WRAPPER = path.join(BIN_DIR, 'headful-chromium.sh');
 
@@ -112,11 +113,89 @@ EOF
   return children;
 }
 
+function ensureNgrok() {
+  if (fs.existsSync(NGROK_BIN) && fs.statSync(NGROK_BIN).size > 1000000) return true;
+  const arch = process.arch === 'arm64' ? 'arm64' : 'amd64';
+  const url = `https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-${arch}.tgz`;
+  const tgzPath = path.join(TMP_DIR, 'ngrok.tgz');
+  console.log(`[free-browser-mcp] Downloading ngrok (${arch})...`);
+  try {
+    execSync(
+      `curl -fL --retry 3 "${url}" -o "${tgzPath}" && tar -xzf "${tgzPath}" -C "${BIN_DIR}" && chmod +x "${NGROK_BIN}"`,
+      { stdio: 'inherit' }
+    );
+    fs.rmSync(tgzPath, { force: true });
+    console.log('[free-browser-mcp] ngrok downloaded.');
+    return true;
+  } catch (err) {
+    console.error('[free-browser-mcp] Failed to download ngrok:', err.message);
+    return false;
+  }
+}
+
+function startNgrok(token, domain) {
+  let activeProc = null;
+  let stopped = false;
+  const configPath = path.join(TMP_DIR, 'ngrok.yml');
+  fs.writeFileSync(configPath, `version: "2"\nauthtoken: ${token}\n`);
+
+  const launch = () => {
+    if (stopped) return;
+    const args = ['http', String(PORT), '--config', configPath, '--log', 'stdout', '--log-format', 'term'];
+    if (domain) {
+      args.push('--url', domain.startsWith('http') ? domain : `https://${domain}`);
+    }
+
+    const proc = spawn(NGROK_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    activeProc = proc;
+
+    let printed = false;
+    const handleOutput = (chunk) => {
+      const text = chunk.toString();
+      process.stdout.write(text);
+      const match = text.match(/https:\/\/[a-z0-9.-]+\.ngrok[-a-z0-9.]*/i);
+      if ((match || text.includes('started tunnel')) && !printed) {
+        printed = true;
+        const baseUrl = domain
+          ? (domain.startsWith('http') ? domain.replace(/\/$/, '') : `https://${domain}`)
+          : match[0];
+        console.log('\n==================================================');
+        console.log(`[free-browser-mcp] PERMANENT HTTPS Streamable MCP: ${baseUrl}/mcp`);
+        console.log(`[free-browser-mcp] PERMANENT HTTPS MCP SSE URL:    ${baseUrl}/sse`);
+        console.log(`[free-browser-mcp] PERMANENT HTTPS noVNC Viewer:   ${baseUrl}/vnc.html?autoconnect=1&resize=scale`);
+        console.log(`[free-browser-mcp] PERMANENT HTTPS Health URL:     ${baseUrl}/health`);
+        console.log('==================================================\n');
+      }
+    };
+
+    proc.stdout.on('data', handleOutput);
+    proc.stderr.on('data', handleOutput);
+    proc.on('exit', (code, signal) => {
+      console.log(`[free-browser-mcp] ngrok exited (code=${code}, signal=${signal})`);
+      if (!stopped) {
+        console.log('[free-browser-mcp] Reconnecting ngrok in 5s...');
+        setTimeout(launch, 5000);
+      }
+    });
+  };
+
+  launch();
+
+  return {
+    kill: (sig = 'SIGTERM') => {
+      stopped = true;
+      if (activeProc) {
+        try { activeProc.kill(sig); } catch {}
+      }
+    }
+  };
+}
+
 async function ensureCloudflared() {
   if (fs.existsSync(CLOUDFLARED_BIN)) return true;
-  const asset =
+  const arch =
     process.arch === 'arm64' ? 'cloudflared-linux-arm64' : 'cloudflared-linux-amd64';
-  const url = `https://github.com/cloudflare/cloudflared/releases/latest/download/${asset}`;
+  const url = `https://github.com/cloudflare/cloudflared/releases/latest/download/${arch}`;
   console.log(`[free-browser-mcp] Downloading cloudflared from ${url}...`);
   try {
     const res = await fetch(url, { redirect: 'follow' });
@@ -264,109 +343,16 @@ async function main() {
 
   startProxy();
 
-  let cfChild = null;
-  if (await ensureCloudflared()) {
-    cfChild = startCloudflared();
-  }
+  let tunnelChild = null;
+  const ngrokToken = (process.env.NGROK_AUTHTOKEN || '').trim();
+  const ngrokDomain = (process.env.NGROK_DOMAIN || 'bright-oxidation-hazily.ngrok-free.dev').trim();
 
-  const configPath = path.join(TMP_DIR, 'playwright-mcp.config.json');
-  fs.writeFileSync(
-    configPath,
-    JSON.stringify({
-      browser: {
-        launchOptions: {
-          executablePath: CHROME_WRAPPER,
-          headless: false,
-          args: [
-            '--start-maximized',
-            '--window-position=0,0',
-            '--window-size=1280,800'
-          ]
-        },
-        contextOptions: {
-          viewport: { width: 1280, height: 800 }
-        }
-      }
-    }, null, 2)
-  );
-
-  const childEnv = {
-    ...process.env,
-    DISPLAY: ':99',
-    PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS: 'true',
-  };
-
-  const mcpCmd = `npx --no-install @playwright/mcp --config ${configPath} --user-data-dir ${USER_DATA_DIR}`;
-
-  console.log(`[free-browser-mcp] Starting STATEFUL HEADFUL supergateway SSE (${SSE_PORT}) and StreamableHTTP (${MCP_HTTP_PORT})...`);
-  console.log(`[free-browser-mcp] MCP command: ${mcpCmd}`);
-
-  const sseChild = spawn(
-    'npx',
-    [
-      '--no-install',
-      'supergateway',
-      '--stdio',
-      mcpCmd,
-      '--port',
-      String(SSE_PORT),
-      '--ssePath',
-      '/sse',
-      '--messagePath',
-      '/message',
-    ],
-    { stdio: 'inherit', env: childEnv }
-  );
-
-  const httpChild = spawn(
-    'npx',
-    [
-      '--no-install',
-      'supergateway',
-      '--stdio',
-      mcpCmd,
-      '--outputTransport',
-      'streamableHttp',
-      '--stateful',
-      '--sessionTimeout',
-      '600000',
-      '--port',
-      String(MCP_HTTP_PORT),
-      '--streamableHttpPath',
-      '/mcp',
-    ],
-    { stdio: 'inherit', env: childEnv }
-  );
-
-  const shutdown = () => {
-    if (cfChild) cfChild.kill('SIGTERM');
-    sseChild.kill('SIGTERM');
-    httpChild.kill('SIGTERM');
-    for (const c of displayChildren) {
-      try { c.kill('SIGTERM'); } catch {}
+  if (ngrokToken) {
+    if (ensureNgrok()) {
+      tunnelChild = startNgrok(ngrokToken, ngrokDomain);
     }
-    process.exit(0);
-  };
-
-  sseChild.on('exit', (code) => {
-    console.log(`[free-browser-mcp] supergateway SSE exited with code=${code}`);
-  });
-  httpChild.on('exit', (code) => {
-    console.log(`[free-browser-mcp] supergateway StreamableHTTP exited with code=${code}`);
-  });
-
-  process.on('SIGTERM', shutdown);
-  process.on('SIGINT', shutdown);
-}
-
-main();
-((r) => setTimeout(r, 2500));
-
-  startProxy();
-
-  let cfChild = null;
-  if (await ensureCloudflared()) {
-    cfChild = startCloudflared();
+  } else if (await ensureCloudflared()) {
+    tunnelChild = startCloudflared();
   }
 
   const configPath = path.join(TMP_DIR, 'playwright-mcp.config.json');
@@ -439,7 +425,7 @@ main();
   );
 
   const shutdown = () => {
-    if (cfChild) cfChild.kill('SIGTERM');
+    if (tunnelChild) tunnelChild.kill('SIGTERM');
     sseChild.kill('SIGTERM');
     httpChild.kill('SIGTERM');
     for (const c of displayChildren) {
