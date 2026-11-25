@@ -133,44 +133,65 @@ async function ensureCloudflared() {
 }
 
 function startCloudflared() {
-  const token = (process.env.CLOUDFLARE_TUNNEL_TOKEN || '').trim();
-  const args = token
-    ? ['tunnel', '--no-autoupdate', 'run', '--token', token]
-    : ['tunnel', '--url', `http://127.0.0.1:${PORT}`, '--no-autoupdate'];
+  let activeCf = null;
+  let stopped = false;
 
-  const cf = spawn(CLOUDFLARED_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  const launch = () => {
+    if (stopped) return;
+    const token = (process.env.CLOUDFLARE_TUNNEL_TOKEN || '').trim();
+    const args = token
+      ? ['tunnel', '--no-autoupdate', 'run', '--token', token]
+      : ['tunnel', '--url', `http://127.0.0.1:${PORT}`, '--no-autoupdate'];
 
-  let printed = false;
-  const handleOutput = (chunk) => {
-    const text = chunk.toString();
-    process.stdout.write(text);
-    if (token && !printed && text.includes('Registered tunnel connection')) {
-      printed = true;
-      console.log('\n==================================================');
-      console.log('[free-browser-mcp] Named Tunnel Connected!');
-      console.log('[free-browser-mcp] Use your fixed Cloudflare Public Hostname (/mcp, /sse, /vnc.html)');
-      console.log('==================================================\n');
-      return;
-    }
-    const match = text.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/i);
-    if (match && !printed) {
-      printed = true;
-      const baseUrl = match[0];
-      console.log('\n==================================================');
-      console.log(`[free-browser-mcp] HTTPS Streamable MCP: ${baseUrl}/mcp`);
-      console.log(`[free-browser-mcp] HTTPS MCP SSE URL:    ${baseUrl}/sse`);
-      console.log(`[free-browser-mcp] HTTPS noVNC Viewer:   ${baseUrl}/vnc.html?autoconnect=1&resize=scale`);
-      console.log(`[free-browser-mcp] HTTPS Health URL:     ${baseUrl}/health`);
-      console.log('==================================================\n');
-    }
+    const cf = spawn(CLOUDFLARED_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    activeCf = cf;
+
+    let printed = false;
+    const handleOutput = (chunk) => {
+      const text = chunk.toString();
+      process.stdout.write(text);
+      if (token && !printed && text.includes('Registered tunnel connection')) {
+        printed = true;
+        console.log('\n==================================================');
+        console.log('[free-browser-mcp] Named Tunnel Connected!');
+        console.log('[free-browser-mcp] Use your fixed Cloudflare Public Hostname (/mcp, /sse, /vnc.html)');
+        console.log('==================================================\n');
+        return;
+      }
+      const match = text.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/i);
+      if (match && !printed) {
+        printed = true;
+        const baseUrl = match[0];
+        console.log('\n==================================================');
+        console.log(`[free-browser-mcp] HTTPS Streamable MCP: ${baseUrl}/mcp`);
+        console.log(`[free-browser-mcp] HTTPS MCP SSE URL:    ${baseUrl}/sse`);
+        console.log(`[free-browser-mcp] HTTPS noVNC Viewer:   ${baseUrl}/vnc.html?autoconnect=1&resize=scale`);
+        console.log(`[free-browser-mcp] HTTPS Health URL:     ${baseUrl}/health`);
+        console.log('==================================================\n');
+      }
+    };
+
+    cf.stdout.on('data', handleOutput);
+    cf.stderr.on('data', handleOutput);
+    cf.on('exit', (code, signal) => {
+      console.log(`[free-browser-mcp] cloudflared exited (code=${code}, signal=${signal})`);
+      if (!stopped) {
+        console.log('[free-browser-mcp] Reconnecting cloudflared in 5s...');
+        setTimeout(launch, 5000);
+      }
+    });
   };
 
-  cf.stdout.on('data', handleOutput);
-  cf.stderr.on('data', handleOutput);
-  cf.on('exit', (code) => {
-    console.log(`[free-browser-mcp] cloudflared exited with code=${code}`);
-  });
-  return cf;
+  launch();
+
+  return {
+    kill: (sig = 'SIGTERM') => {
+      stopped = true;
+      if (activeCf) {
+        try { activeCf.kill(sig); } catch {}
+      }
+    }
+  };
 }
 
 function startProxy() {
