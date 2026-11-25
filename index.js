@@ -360,3 +360,103 @@ async function main() {
 }
 
 main();
+((r) => setTimeout(r, 2500));
+
+  startProxy();
+
+  let cfChild = null;
+  if (await ensureCloudflared()) {
+    cfChild = startCloudflared();
+  }
+
+  const configPath = path.join(TMP_DIR, 'playwright-mcp.config.json');
+  fs.writeFileSync(
+    configPath,
+    JSON.stringify({
+      browser: {
+        launchOptions: {
+          executablePath: CHROME_WRAPPER,
+          headless: false,
+          args: [
+            '--start-maximized',
+            '--window-position=0,0',
+            '--window-size=1280,800'
+          ]
+        },
+        contextOptions: {
+          viewport: { width: 1280, height: 800 }
+        }
+      }
+    }, null, 2)
+  );
+
+  const childEnv = {
+    ...process.env,
+    DISPLAY: ':99',
+    PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS: 'true',
+  };
+
+  const mcpCmd = `npx --no-install @playwright/mcp --config ${configPath} --user-data-dir ${USER_DATA_DIR}`;
+
+  console.log(`[free-browser-mcp] Starting STATEFUL HEADFUL supergateway SSE (${SSE_PORT}) and StreamableHTTP (${MCP_HTTP_PORT})...`);
+  console.log(`[free-browser-mcp] MCP command: ${mcpCmd}`);
+
+  const sseChild = spawn(
+    'npx',
+    [
+      '--no-install',
+      'supergateway',
+      '--stdio',
+      mcpCmd,
+      '--port',
+      String(SSE_PORT),
+      '--ssePath',
+      '/sse',
+      '--messagePath',
+      '/message',
+    ],
+    { stdio: 'inherit', env: childEnv }
+  );
+
+  const httpChild = spawn(
+    'npx',
+    [
+      '--no-install',
+      'supergateway',
+      '--stdio',
+      mcpCmd,
+      '--outputTransport',
+      'streamableHttp',
+      '--stateful',
+      '--sessionTimeout',
+      '600000',
+      '--port',
+      String(MCP_HTTP_PORT),
+      '--streamableHttpPath',
+      '/mcp',
+    ],
+    { stdio: 'inherit', env: childEnv }
+  );
+
+  const shutdown = () => {
+    if (cfChild) cfChild.kill('SIGTERM');
+    sseChild.kill('SIGTERM');
+    httpChild.kill('SIGTERM');
+    for (const c of displayChildren) {
+      try { c.kill('SIGTERM'); } catch {}
+    }
+    process.exit(0);
+  };
+
+  sseChild.on('exit', (code) => {
+    console.log(`[free-browser-mcp] supergateway SSE exited with code=${code}`);
+  });
+  httpChild.on('exit', (code) => {
+    console.log(`[free-browser-mcp] supergateway StreamableHTTP exited with code=${code}`);
+  });
+
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
+}
+
+main();
